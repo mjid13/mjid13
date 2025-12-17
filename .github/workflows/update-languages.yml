@@ -16,60 +16,7 @@ jobs:
       - name: Checkout profile repo
         uses: actions/checkout@v4
 
-      - name: Generate languages block
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          # Fetch up to 200 non-fork repos (public) for the authenticated user
-          repos=$(gh repo list --source --limit 200 --json nameWithOwner,isFork --jq '.[] | select(.isFork==false) | .nameWithOwner')
-
-          declare -A totals
-          grand=0
-
-          for r in $repos; do
-            # Languages in bytes for this repo
-            json=$(gh api "repos/$r/languages" || echo "{}")
-
-            # Sum bytes by language
-            while IFS=$'\t' read -r lang bytes; do
-              [[ -z "${lang:-}" || -z "${bytes:-}" ]] && continue
-              totals["$lang"]=$(( ${totals["$lang"]:-0} + bytes ))
-              grand=$(( grand + bytes ))
-            done < <(python - <<'PY'
-import json,sys
-data=json.loads(sys.stdin.read() or "{}")
-for k,v in data.items():
-    print(f"{k}\t{v}")
-PY
-<<<"$json")
-          done
-
-          # Build markdown table sorted by bytes desc (top 10)
-          block=$(python - <<'PY'
-import os
-totals = {k:int(v) for k,v in os.environ.items() if k.startswith("LANG__")}
-grand = int(os.environ.get("GRAND","0"))
-items = sorted(((k[6:],v) for k,v in totals.items()), key=lambda x: x[1], reverse=True)[:10]
-
-def pct(v): 
-    return (v / grand * 100.0) if grand else 0.0
-
-lines = []
-lines.append("| Language | Share |")
-lines.append("|---|---:|")
-for lang, bytes_ in items:
-    lines.append(f"| {lang} | {pct(bytes_):.1f}% |")
-
-print("\n".join(lines) if items else "_No language data found._")
-PY
-)
-
-          # Export totals into env for python block above
-        shell: bash
-
-      - name: Export totals to env and rewrite README
+      - name: Update languages in README
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
