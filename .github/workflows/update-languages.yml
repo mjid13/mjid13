@@ -1,0 +1,133 @@
+name: Update languages in profile README
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # daily at 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout profile repo
+        uses: actions/checkout@v4
+
+      - name: Generate languages block
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Fetch up to 200 non-fork repos (public) for the authenticated user
+          repos=$(gh repo list --source --limit 200 --json nameWithOwner,isFork --jq '.[] | select(.isFork==false) | .nameWithOwner')
+
+          declare -A totals
+          grand=0
+
+          for r in $repos; do
+            # Languages in bytes for this repo
+            json=$(gh api "repos/$r/languages" || echo "{}")
+
+            # Sum bytes by language
+            while IFS=$'\t' read -r lang bytes; do
+              [[ -z "${lang:-}" || -z "${bytes:-}" ]] && continue
+              totals["$lang"]=$(( ${totals["$lang"]:-0} + bytes ))
+              grand=$(( grand + bytes ))
+            done < <(python - <<'PY'
+import json,sys
+data=json.loads(sys.stdin.read() or "{}")
+for k,v in data.items():
+    print(f"{k}\t{v}")
+PY
+<<<"$json")
+          done
+
+          # Build markdown table sorted by bytes desc (top 10)
+          block=$(python - <<'PY'
+import os
+totals = {k:int(v) for k,v in os.environ.items() if k.startswith("LANG__")}
+grand = int(os.environ.get("GRAND","0"))
+items = sorted(((k[6:],v) for k,v in totals.items()), key=lambda x: x[1], reverse=True)[:10]
+
+def pct(v): 
+    return (v / grand * 100.0) if grand else 0.0
+
+lines = []
+lines.append("| Language | Share |")
+lines.append("|---|---:|")
+for lang, bytes_ in items:
+    lines.append(f"| {lang} | {pct(bytes_):.1f}% |")
+
+print("\n".join(lines) if items else "_No language data found._")
+PY
+)
+
+          # Export totals into env for python block above
+        shell: bash
+
+      - name: Export totals to env and rewrite README
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Recompute in one shot and rewrite README (keeps it deterministic)
+          python - <<'PY'
+import subprocess, json, re, os
+
+def sh(cmd):
+  return subprocess.check_output(cmd, text=True).strip()
+
+repos_json = sh(["gh","repo","list","--source","--limit","200","--json","nameWithOwner,isFork"])
+repos = [r["nameWithOwner"] for r in json.loads(repos_json) if not r["isFork"]]
+
+totals={}
+grand=0
+for r in repos:
+  try:
+    data=json.loads(sh(["gh","api",f"repos/{r}/languages"]) or "{}")
+  except subprocess.CalledProcessError:
+    data={}
+  for k,v in data.items():
+    totals[k]=totals.get(k,0)+int(v)
+    grand+=int(v)
+
+items=sorted(totals.items(), key=lambda x:x[1], reverse=True)[:10]
+if items and grand:
+  table=["| Language | Share |","|---|---:|"]
+  for lang, bytes_ in items:
+    table.append(f"| {lang} | {bytes_/grand*100:.1f}% |")
+  block="\n".join(table)
+else:
+  block="_No language data found._"
+
+path="README.md"
+txt=open(path,"r",encoding="utf-8").read()
+
+pattern=r"<!-- LANGUAGES:START -->(.|\n)*?<!-- LANGUAGES:END -->"
+replacement=f"<!-- LANGUAGES:START -->\n{block}\n<!-- LANGUAGES:END -->"
+
+if not re.search(pattern, txt):
+  raise SystemExit("Missing LANGUAGES markers in README.md")
+
+new_txt=re.sub(pattern, replacement, txt)
+open(path,"w",encoding="utf-8").write(new_txt)
+PY
+
+      - name: Commit and push if changed
+        run: |
+          set -e
+          if git diff --quiet; then
+            echo "No changes."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "chore: update languages section"
+          git push
+
